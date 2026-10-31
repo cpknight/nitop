@@ -1,0 +1,22 @@
+name: Interface shown wrongly
+description: An interface has the wrong type, hardware name or details
+labels: [hardware]
+body:
+  - type: textarea
+    id: shown
+    attributes:
+      label: What nitop shows, and what's correct
+    validations:
+      required: true
+  - type: textarea
+    id: sysfs
+    attributes:
+      label: Interface information
+      description: Replace eth0 with your interface, and run this. It doesn't print any addresses.
+      render: text
+      value: |
+        cat /sys/class/net/eth0/type /sys/class/net/eth0/uevent
+        ls /sys/class/net/eth0
+        cat /sys/class/net/eth0/device/uevent
+    validations:
+      required: true

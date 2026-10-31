@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Check the binary runs
+        run: target/${{ matrix.target }}/release/nitop --version
+      - name: Package
+        run: |
+          name=nitop-${{ matrix.target }}.tar.gz
+          tar czf "$name" -C target/${{ matrix.target }}/release nitop -C "$GITHUB_WORKSPACE" LICENSE README.md
+          sha256sum "$name" > "$name.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: nitop-*
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Extract release notes from the changelog
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^(## |\[)/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

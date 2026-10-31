@@ -291,7 +291,7 @@ fn install_one(sig: libc::c_int) {
     // SA_RESTART is left unset so a blocked poll returns and the loop can restore the terminal.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = on_signal as libc::sighandler_t;
+        action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
         libc::sigemptyset(std::ptr::addr_of_mut!(action.sa_mask));
         libc::sigaction(sig, &action, std::ptr::null_mut());
     }

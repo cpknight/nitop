@@ -16,6 +16,7 @@ mod zerotier;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 const INTERVALS_MS: [u64; 7] = [100, 250, 500, 1000, 2000, 5000, 10000];
@@ -146,10 +147,14 @@ fn run() -> std::io::Result<()> {
         return Err(std::io::Error::other("must be run in a terminal"));
     }
     // Before touching the terminal, so a failure prints normally.
-    let (monitor, mut last) = net::Monitor::new()?;
+    let (monitor, started) = net::Monitor::new()?;
     let mut app = App::new(monitor, theme::Theme::load());
-    let mut terminal = ratatui::try_init()?;
-    let result = event_loop(&mut terminal, &mut app, &mut last);
+    let mut clock = SampleClock::new(started);
+    // try_init enables raw mode before it can fail. Restore on that path too,
+    // or the shell stays raw when the alternate screen or terminal setup fails.
+    let mut terminal = ratatui::try_init().inspect_err(|_| ratatui::restore())?;
+    install_signal_handlers();
+    let result = event_loop(&mut terminal, &mut app, &mut clock);
     ratatui::restore();
     result
 }
@@ -157,18 +162,24 @@ fn run() -> std::io::Result<()> {
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    last: &mut Instant,
+    clock: &mut SampleClock,
 ) -> std::io::Result<()> {
     let mut dirty = true;
     let mut last_frame = Instant::now();
     loop {
+        match take_signal(terminal)? {
+            SignalAction::Quit => return Ok(()),
+            SignalAction::Redraw => dirty = true,
+            SignalAction::None => {}
+        }
         if dirty {
             terminal.draw(|f| ui::draw(f, app))?;
             dirty = false;
         }
         let period = Duration::from_millis(app.interval_ms());
-        let wait = period
-            .saturating_sub(last.elapsed())
+        let now = Instant::now();
+        let wait = clock
+            .wait(now, period)
             .min(FRAME.saturating_sub(last_frame.elapsed()));
         if event::poll(wait)? {
             match event::read()? {
@@ -183,16 +194,23 @@ fn event_loop(
                 _ => {}
             }
         }
-        if last.elapsed() >= period {
-            let now = Instant::now();
-            let dt = now.duration_since(*last).as_secs_f64();
-            *last = now;
-            // A transient read failure skips one tick; the next delta covers the gap
-            // in bytes, and rates stay correct from then on.
+        match take_signal(terminal)? {
+            SignalAction::Quit => return Ok(()),
+            SignalAction::Redraw => dirty = true,
+            SignalAction::None => {}
+        }
+        let now = Instant::now();
+        if clock.due(now, period) {
+            let dt = clock.gap(now);
+            // Leave the clock where it is on failure. Advancing it would divide
+            // the bytes of two intervals by one interval and stick that spike as the peak.
             if app.monitor.sample(dt).is_ok() {
+                clock.succeeded(now);
                 app.meters.rx.feed(app.monitor.master.rx.rate);
                 app.meters.tx.feed(app.monitor.master.tx.rate);
                 dirty = true;
+            } else {
+                clock.failed(now, period);
             }
         }
         if last_frame.elapsed() >= FRAME {
@@ -200,6 +218,112 @@ fn event_loop(
             last_frame = Instant::now();
         }
     }
+}
+
+/// Sample timing. A failed read does not move `last_ok`, so the next success
+/// covers the whole gap, and `retry_after` keeps a persistent error from spinning.
+struct SampleClock {
+    last_ok: Instant,
+    retry_after: Option<Instant>,
+}
+
+impl SampleClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_ok: now,
+            retry_after: None,
+        }
+    }
+
+    fn wait(&self, now: Instant, period: Duration) -> Duration {
+        match self.retry_after {
+            Some(at) if now < at => at.saturating_duration_since(now),
+            _ => period.saturating_sub(now.saturating_duration_since(self.last_ok)),
+        }
+    }
+
+    fn due(&self, now: Instant, period: Duration) -> bool {
+        if self.retry_after.is_some_and(|at| now < at) {
+            return false;
+        }
+        now.saturating_duration_since(self.last_ok) >= period
+    }
+
+    fn gap(&self, now: Instant) -> f64 {
+        now.saturating_duration_since(self.last_ok).as_secs_f64()
+    }
+
+    fn succeeded(&mut self, now: Instant) {
+        self.last_ok = now;
+        self.retry_after = None;
+    }
+
+    fn failed(&mut self, now: Instant, period: Duration) {
+        self.retry_after = Some(now + period);
+    }
+}
+
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+enum SignalAction {
+    None,
+    Quit,
+    Redraw,
+}
+
+extern "C" fn on_signal(sig: libc::c_int) {
+    // A fatal signal replaces a pending suspend. Suspend must not hide a request to exit.
+    if sig == libc::SIGTSTP {
+        let _ = SIGNAL.compare_exchange(0, sig, Ordering::Relaxed, Ordering::Relaxed);
+    } else {
+        SIGNAL.store(sig, Ordering::Relaxed);
+    }
+}
+
+fn install_signal_handlers() {
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGTSTP] {
+        install_one(sig);
+    }
+}
+
+fn install_one(sig: libc::c_int) {
+    // SAFETY: `action` is a valid sigaction, and the handler only stores an atomic.
+    // SA_RESTART is left unset so a blocked poll returns and the loop can restore the terminal.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_signal as libc::sighandler_t;
+        libc::sigemptyset(std::ptr::addr_of_mut!(action.sa_mask));
+        libc::sigaction(sig, &action, std::ptr::null_mut());
+    }
+}
+
+fn take_signal(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<SignalAction> {
+    match SIGNAL.swap(0, Ordering::SeqCst) {
+        0 => Ok(SignalAction::None),
+        sig if sig == libc::SIGTSTP => {
+            suspend(terminal)?;
+            Ok(SignalAction::Redraw)
+        }
+        _ => Ok(SignalAction::Quit),
+    }
+}
+
+fn suspend(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+    ratatui::restore();
+    // SAFETY: the default action stops the process. The handler is put back after
+    // resume so a later Ctrl-Z still restores the terminal before stopping.
+    unsafe {
+        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        libc::raise(libc::SIGTSTP);
+        install_one(libc::SIGTSTP);
+    }
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::EnterAlternateScreen
+    )?;
+    terminal.clear()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -278,5 +402,23 @@ mod tests {
         assert_eq!(a.page, usize::MAX);
         press(&mut a, KeyCode::Home);
         assert_eq!(a.page, 0);
+    }
+
+    #[test]
+    fn failed_sample_keeps_the_clock_so_the_next_dt_covers_the_gap() {
+        let t0 = Instant::now();
+        let mut clock = SampleClock::new(t0);
+        let period = Duration::from_secs(1);
+        let t1 = t0 + period;
+        assert!(clock.due(t1, period));
+        assert!((clock.gap(t1) - 1.0).abs() < 0.05);
+        clock.failed(t1, period);
+        assert!(!clock.due(t1 + Duration::from_millis(100), period));
+        let t2 = t1 + period;
+        assert!(clock.due(t2, period));
+        assert!((clock.gap(t2) - 2.0).abs() < 0.05);
+        clock.succeeded(t2);
+        assert!(!clock.due(t2, period));
+        assert!(clock.gap(t2) < 0.05);
     }
 }

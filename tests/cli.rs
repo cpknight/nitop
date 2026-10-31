@@ -49,10 +49,10 @@ fn refuses_to_start_without_a_terminal() {
 /// with a key press. Checks it draws, exits cleanly and restores the terminal.
 #[test]
 fn runs_draws_and_quits_in_a_terminal() {
-    if Command::new("script").arg("--version").output().is_err() {
-        eprintln!("skipped: `script` is not installed");
-        return;
-    }
+    assert!(
+        Command::new("script").arg("--version").output().is_ok(),
+        "`script` from util-linux is required for this test"
+    );
     let inner = format!("stty cols 120 rows 40; exec '{BIN}'");
     let mut child = Command::new("script")
         .args(["-qec", &inner, "/dev/null"])

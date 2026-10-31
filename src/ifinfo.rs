@@ -1,7 +1,7 @@
 //! What an interface is: its kind, hardware and link details, from sysfs and the hwdata
 //! ID databases.
 
-use crate::wifi::{self, WifiLink};
+use crate::wifi::WifiLink;
 use crate::zerotier;
 use std::fs;
 use std::path::Path;
@@ -148,9 +148,17 @@ fn read_static_in(roots: &Roots, name: &str) -> Details {
     }
 }
 
-/// Updates the parts that can change: address, MTU, duplex and the Wi-Fi link.
+/// Updates the parts that can change: address, MTU and duplex.
+/// The Wi-Fi link is filled in by the caller from a background poller, because a
+/// scan dump must not run on the thread that draws the display.
 pub fn refresh(name: &str, d: &mut Details) {
     refresh_in(&SYSTEM, name, d)
+}
+
+pub fn ifindex(name: &str) -> Option<u32> {
+    read_trim(&format!("/sys/class/net/{name}/ifindex"))?
+        .parse()
+        .ok()
 }
 
 fn refresh_in(roots: &Roots, name: &str, d: &mut Details) {
@@ -170,11 +178,6 @@ fn refresh_in(roots: &Roots, name: &str, d: &mut Details) {
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|&s| s > 0)
         .map(|s| s as u32);
-    if d.kind == "Wi-Fi" {
-        d.wifi = read("ifindex")
-            .and_then(|s| s.parse().ok())
-            .and_then(wifi::query);
-    }
 }
 
 fn read_trim(path: &str) -> Option<String> {

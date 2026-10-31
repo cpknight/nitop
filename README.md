@@ -6,7 +6,7 @@
 
 A [btop](https://github.com/aristocratos/btop)-style terminal monitor for network interfaces. It shows every interface at a glance, each in its own box, with one rollup of all your traffic on top.
 
-![nitop showing an all-traffic rollup with level meters above boxes for Ethernet, Wi-Fi, WireGuard and loopback interfaces](docs/screenshot.png)
+![nitop showing an all-traffic rollup with level meters above boxes for Ethernet, Wi-Fi, WireGuard and loopback interfaces](https://raw.githubusercontent.com/cpknight/nitop/v0.2.1/docs/screenshot.png)
 
 *The screenshot uses made-up data.*
 
@@ -66,7 +66,7 @@ Run `nitop`. It has no options besides `--help` and `--version`.
 - **Hardware names** come from the `hwdata` package's `pci.ids` and `usb.ids`. Without it, or for a card it doesn't list, you see the numeric ID or a more general chip name.
 - **VPN product names** (ZeroTier, Tailscale and so on) are inferred from the interface name for TUN/TAP devices, because the kernel doesn't record who owns one.
 - **ZeroTier details** come from `zerotier-cli` if you have access to it, which also gives live status. Otherwise nitop reads the name, ID and type from the daemon's network files, which is its private format and could change. To get status without root, copy the auth token: `sudo install -m 600 -o "$USER" /var/lib/zerotier-one/authtoken.secret ~/.zeroTierOneAuthToken`. Treat that file like a password, as it allows control of the ZeroTier service.
-- **Theme:** read at startup from `color_theme` in `~/.config/btop/btop.conf`, with btop-like defaults otherwise. Restart nitop to pick up a theme change.
+- **Theme:** read at startup from `color_theme` in `~/.config/btop/btop.conf`. `Default` and `TTY` are btop's builtin themes, and those colors are what nitop uses when nothing else is set. Restart nitop to pick up a theme change.
 
 ## Contributing
 
@@ -74,7 +74,7 @@ Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md
 
 ## Credits
 
-nitop was written by [Claude](https://claude.com/claude-code), Anthropic's AI coding agent, working from the direction of its maintainer, [@cpknight](https://github.com/cpknight). The look comes from [btop](https://github.com/aristocratos/btop), and the terminal UI is built with [ratatui](https://ratatui.rs).
+nitop was written by [Claude](https://claude.com/claude-code), Anthropic's AI coding agent, working from the direction of its maintainer, [@cpknight](https://github.com/cpknight). The 0.2.1 corrections were made by [Grok](https://x.ai), xAI's coding agent, with the same maintainer. The look comes from [btop](https://github.com/aristocratos/btop), and the terminal UI is built with [ratatui](https://ratatui.rs).
 
 ## License
 

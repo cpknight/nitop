@@ -22,7 +22,7 @@ CI runs the format check, clippy and tests on every pull request, so running the
 | `src/main.rs` | Arguments, key handling, event loop |
 | `src/net.rs` | Reads kernel counters and derives rates and totals |
 | `src/ifinfo.rs` | Works out what an interface is, from sysfs and `hwdata` |
-| `src/wifi.rs` | Wi-Fi link state, over nl80211 |
+| `src/wifi.rs` | Wi-Fi link state over nl80211, refreshed on a background thread |
 | `src/zerotier.rs` | ZeroTier network details, on a background thread |
 | `src/meter.rs` | Level meter behavior and scale |
 | `src/theme.rs` | Loads colors from the btop theme |

@@ -1,10 +1,10 @@
 [package]
 name = "nitop"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89"
 description = "A btop-style terminal monitor for network interfaces"
-authors = ["Claude <noreply@anthropic.com>", "CP Knight"]
+authors = ["CP Knight <chris@cpknight.io>", "Claude <noreply@anthropic.com>", "Grok (xAI)"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/cpknight/nitop"

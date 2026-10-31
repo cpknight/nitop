@@ -1,7 +1,11 @@
 //! Wi-Fi link state, asked directly of the kernel over nl80211 (the interface `iw` uses).
 //! Needs no privileges and no external tools. Every field is best effort.
 
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 const NETLINK_GENERIC: i32 = 16;
 const GENL_ID_CTRL: u16 = 0x10;
@@ -40,6 +44,9 @@ const RATE_EHT_MCS: u16 = 19;
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct WifiLink {
     pub ssid: Option<String>,
+    /// The associated BSS advertised an empty or all-zero SSID. Distinct from a
+    /// scan that failed or never saw the BSS, which leaves both this and `ssid` unset.
+    pub hidden: bool,
     pub freq_mhz: Option<u32>,
     pub width_mhz: Option<u32>,
     pub signal_dbm: Option<i32>,
@@ -64,10 +71,17 @@ fn band_channel(f: u32) -> Option<(&'static str, u32)> {
     match f {
         2484 => Some(("2.4", 14)),
         2412..=2472 => Some(("2.4", (f - 2407) / 5)),
+        // Channel 2 sits below the regular 6 GHz grid.
+        5935 => Some(("6", 2)),
         5955..=7115 => Some(("6", (f - 5950) / 5)),
-        5160..=5885 => Some(("5", (f - 5000) / 5)),
+        // Through UNII-4 (channels 181 and 185). 6 GHz starts above this.
+        5160..=5925 => Some(("5", (f - 5000) / 5)),
         _ => None,
     }
+}
+
+fn is_6ghz(f: u32) -> bool {
+    f == 5935 || (5955..=7115).contains(&f)
 }
 
 /// Current link for one interface, or `None` if nl80211 can't be reached.
@@ -104,7 +118,12 @@ pub fn query(ifindex: u32) -> Option<WifiLink> {
                 CMD_GET_SCAN,
                 &attr(ATTR_IFINDEX, &idx),
             );
-            link.ssid = scan.and_then(|msgs| msgs.iter().find_map(|m| associated_ssid(m)));
+            // A failed or empty scan stays unnamed. Only an empty SSID element is hidden.
+            match scan.and_then(|msgs| msgs.iter().find_map(|m| associated_ssid(m))) {
+                Some(SsidHit::Named(ssid)) => link.ssid = Some(ssid),
+                Some(SsidHit::Hidden) => link.hidden = true,
+                None => {}
+            }
         }
     }
     Some(link)
@@ -134,17 +153,24 @@ fn apply_station(link: &mut WifiLink, payload: &[u8]) {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum SsidHit {
+    Named(String),
+    Hidden,
+}
+
 /// The SSID in a scan result, if that result is the AP we're associated with.
-fn associated_ssid(payload: &[u8]) -> Option<String> {
+fn associated_ssid(payload: &[u8]) -> Option<SsidHit> {
     let (_, bss) = Attrs(payload).find(|(t, _)| *t == ATTR_BSS)?;
     Attrs(bss).find(|(t, _)| *t == BSS_STATUS)?;
     let (_, ies) = Attrs(bss).find(|(t, _)| *t == BSS_INFORMATION_ELEMENTS)?;
     let ssid = find_ie(ies, IE_SSID)?;
-    // Hidden networks advertise an empty or all-zero SSID.
-    if ssid.iter().all(|&b| b == 0) {
-        return None;
+    // Hidden networks advertise an empty or all-zero SSID. A missing element is
+    // not that: the scan simply didn't carry a name.
+    if ssid.is_empty() || ssid.iter().all(|&b| b == 0) {
+        return Some(SsidHit::Hidden);
     }
-    Some(String::from_utf8_lossy(ssid).into_owned())
+    Some(SsidHit::Named(String::from_utf8_lossy(ssid).into_owned()))
 }
 
 /// Finds an 802.11 information element (id, length, data).
@@ -176,7 +202,7 @@ fn apply_rate(link: &mut WifiLink, rate: &[u8]) {
     link.generation = match rank {
         4 => Some("Wi-Fi 4"),
         5 => Some("Wi-Fi 5"),
-        6 if link.freq_mhz.is_some_and(|f| f > 5900) => Some("Wi-Fi 6E"),
+        6 if link.freq_mhz.is_some_and(is_6ghz) => Some("Wi-Fi 6E"),
         6 => Some("Wi-Fi 6"),
         7 => Some("Wi-Fi 7"),
         _ => None,
@@ -266,7 +292,7 @@ impl Socket {
                 return None;
             }
             let sock = Socket(fd);
-            // This runs on the UI thread, so it must never hang the display.
+            // One stuck command must not stall the poller, which serves every interface.
             let tv = libc::timeval {
                 tv_sec: 0,
                 tv_usec: 200_000,
@@ -318,21 +344,86 @@ impl Socket {
             if n <= 0 {
                 return None;
             }
-            let mut more = false;
-            for (ty, msg_flags, payload) in split_messages(&buf[..n as usize]) {
-                match ty {
-                    NLMSG_DONE => return Some(out),
-                    NLMSG_ERROR => return None,
-                    _ => {
-                        more = msg_flags & NLM_F_MULTI != 0;
-                        out.push(payload.to_vec());
-                    }
-                }
-            }
-            if !more {
-                return Some(out);
+            match absorb(&mut out, &buf[..n as usize]) {
+                Step::More => {}
+                Step::Done => return Some(out),
+                Step::Failed => return None,
             }
         }
+    }
+}
+
+enum Step {
+    More,
+    Done,
+    Failed,
+}
+
+/// Folds one netlink datagram into `out`. Multipart replies set `NLM_F_MULTI`
+/// and finish with `NLMSG_DONE`; `NLMSG_ERROR` fails the whole request.
+fn absorb(out: &mut Vec<Vec<u8>>, datagram: &[u8]) -> Step {
+    let mut more = false;
+    for (ty, flags, payload) in split_messages(datagram) {
+        match ty {
+            NLMSG_DONE => return Step::Done,
+            NLMSG_ERROR => return Step::Failed,
+            _ => {
+                more = flags & NLM_F_MULTI != 0;
+                out.push(payload.to_vec());
+            }
+        }
+    }
+    if more { Step::More } else { Step::Done }
+}
+
+const POLL_EVERY: Duration = Duration::from_secs(5);
+
+/// Refreshes Wi-Fi links off the UI thread. A scan dump can take several
+/// round trips; the display only reads the last result.
+pub struct Poller {
+    wanted: Arc<Mutex<HashSet<u32>>>,
+    results: Arc<Mutex<HashMap<u32, WifiLink>>>,
+}
+
+impl Poller {
+    pub fn start() -> Self {
+        let wanted = Arc::new(Mutex::new(HashSet::new()));
+        let results = Arc::new(Mutex::new(HashMap::new()));
+        let wanted_bg = Arc::clone(&wanted);
+        let results_bg = Arc::clone(&results);
+        thread::spawn(move || {
+            loop {
+                let indexes: Vec<u32> = wanted_bg
+                    .lock()
+                    .map(|set| set.iter().copied().collect())
+                    .unwrap_or_default();
+                if indexes.is_empty() {
+                    thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                for idx in indexes {
+                    if let Some(link) = query(idx)
+                        && let Ok(mut map) = results_bg.lock()
+                    {
+                        map.insert(idx, link);
+                    }
+                }
+                thread::sleep(POLL_EVERY);
+            }
+        });
+        Poller { wanted, results }
+    }
+
+    /// Replaces the set of interfaces to refresh. Dropped indexes stop being queried.
+    pub fn watch(&self, indexes: impl IntoIterator<Item = u32>) {
+        if let Ok(mut set) = self.wanted.lock() {
+            set.clear();
+            set.extend(indexes);
+        }
+    }
+
+    pub fn get(&self, ifindex: u32) -> Option<WifiLink> {
+        self.results.lock().ok()?.get(&ifindex).cloned()
     }
 }
 
@@ -395,16 +486,22 @@ mod tests {
     fn ssid_comes_only_from_the_associated_scan_entry() {
         let ies = [1, 2, 0xaa, 0xbb, 0, 4, b'h', b'o', b'm', b'e'];
         assert_eq!(
-            associated_ssid(&scan_entry(true, &ies)).as_deref(),
-            Some("home")
+            associated_ssid(&scan_entry(true, &ies)),
+            Some(SsidHit::Named("home".into()))
         );
         assert_eq!(associated_ssid(&scan_entry(false, &ies)), None);
     }
 
     #[test]
-    fn hidden_and_truncated_ssids_are_none() {
-        assert_eq!(associated_ssid(&scan_entry(true, &[0, 0])), None);
-        assert_eq!(associated_ssid(&scan_entry(true, &[0, 3, 0, 0, 0])), None);
+    fn hidden_ssid_is_distinct_from_a_truncated_one() {
+        assert_eq!(
+            associated_ssid(&scan_entry(true, &[0, 0])),
+            Some(SsidHit::Hidden)
+        );
+        assert_eq!(
+            associated_ssid(&scan_entry(true, &[0, 3, 0, 0, 0])),
+            Some(SsidHit::Hidden)
+        );
         assert_eq!(associated_ssid(&scan_entry(true, &[0, 9, b'x'])), None);
     }
 
@@ -413,7 +510,64 @@ mod tests {
         assert_eq!(band_channel(2412), Some(("2.4", 1)));
         assert_eq!(band_channel(2484), Some(("2.4", 14)));
         assert_eq!(band_channel(5180), Some(("5", 36)));
+        assert_eq!(band_channel(5905), Some(("5", 181)));
+        assert_eq!(band_channel(5925), Some(("5", 185)));
+        assert_eq!(band_channel(5935), Some(("6", 2)));
         assert_eq!(band_channel(5955), Some(("6", 1)));
         assert_eq!(band_channel(100), None);
+    }
+
+    #[test]
+    fn wifi_6e_is_only_the_6ghz_band() {
+        let mut link = WifiLink {
+            freq_mhz: Some(5905),
+            ..Default::default()
+        };
+        apply_rate(&mut link, &attr(RATE_HE_MCS, &[9]));
+        assert_eq!(link.generation, Some("Wi-Fi 6"));
+        link.freq_mhz = Some(5955);
+        apply_rate(&mut link, &attr(RATE_HE_MCS, &[9]));
+        assert_eq!(link.generation, Some("Wi-Fi 6E"));
+        link.freq_mhz = Some(5935);
+        apply_rate(&mut link, &attr(RATE_HE_MCS, &[9]));
+        assert_eq!(link.generation, Some("Wi-Fi 6E"));
+    }
+
+    fn nlmsg(ty: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
+        let len = 16 + payload.len();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(len as u32).to_ne_bytes());
+        msg.extend_from_slice(&ty.to_ne_bytes());
+        msg.extend_from_slice(&flags.to_ne_bytes());
+        msg.extend_from_slice(&1u32.to_ne_bytes());
+        msg.extend_from_slice(&0u32.to_ne_bytes());
+        msg.extend_from_slice(payload);
+        msg
+    }
+
+    #[test]
+    fn multipart_reply_finishes_on_the_second_datagram() {
+        let attrs = attr(ATTR_SSID, b"home");
+        let mut body = vec![0, 1, 0, 0];
+        body.extend_from_slice(&attrs);
+        let mut out = Vec::new();
+        assert!(matches!(
+            absorb(&mut out, &nlmsg(family_type(), NLM_F_MULTI, &body)),
+            Step::More
+        ));
+        assert_eq!(out, vec![attrs.clone()]);
+        assert!(matches!(
+            absorb(&mut out, &nlmsg(NLMSG_DONE, 0, &[])),
+            Step::Done
+        ));
+        assert_eq!(out, vec![attrs]);
+        assert!(matches!(
+            absorb(&mut out, &nlmsg(NLMSG_ERROR, 0, &[])),
+            Step::Failed
+        ));
+    }
+
+    fn family_type() -> u16 {
+        32
     }
 }

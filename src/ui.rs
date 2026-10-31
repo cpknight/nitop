@@ -439,8 +439,9 @@ fn link_segments(d: &Details, app: &App) -> Vec<Seg> {
                 .label("SSID")
                 .color(t.title)
                 .elastic(),
+            None if w.hidden => Seg::new("hidden SSID").color(t.inactive),
             None if w.signal_dbm.is_none() => Seg::new("not connected").color(t.inactive),
-            None => Seg::new("hidden SSID").color(t.inactive),
+            None => Seg::new("scan unavailable").color(t.inactive),
         });
         if let Some(s) = w.signal_dbm {
             let c = if s >= -60 {
@@ -478,16 +479,31 @@ fn link_segments(d: &Details, app: &App) -> Vec<Seg> {
     row
 }
 
+/// Columns taken by `+N` and the gap before it. `N` can be wider than one digit.
+fn more_span(remaining: usize) -> usize {
+    const GAP: usize = 2;
+    let mut digits = 1;
+    let mut n = remaining;
+    while n >= 10 {
+        digits += 1;
+        n /= 10;
+    }
+    1 + digits + GAP
+}
+
 /// As many addresses as fit in `width`, then a count of the rest.
 fn address_segments(addresses: &[String], width: usize) -> Vec<Seg> {
     const GAP: usize = 2;
-    const MORE: usize = 2 + GAP; // "+9" and the gap before it
     let mut row = Vec::new();
     let mut used = 0;
     for (i, a) in addresses.iter().enumerate() {
         let len = a.chars().count() + if i == 0 { 0 } else { GAP };
-        let last = i + 1 == addresses.len();
-        let reserve = if last { 0 } else { MORE };
+        let remaining = addresses.len() - i - 1;
+        let reserve = if remaining == 0 {
+            0
+        } else {
+            more_span(remaining)
+        };
         if used + len + reserve > width {
             if i == 0 {
                 row.push(Seg::new(a.clone()).elastic());
@@ -1194,6 +1210,17 @@ mod tests {
         assert_eq!(values(20), ["aaaaaaaaaa", "+2"]);
         assert_eq!(values(5), ["aaaaaaaaaa"]);
         assert!(address_segments(&[], 30).is_empty());
+
+        // "+10" is three columns. Reserving only "+9" would draw past `width`.
+        let many = vec!["x".to_string(); 11];
+        let shown = |width: usize| -> Vec<String> {
+            address_segments(&many, width)
+                .into_iter()
+                .map(|s| s.value)
+                .collect()
+        };
+        assert_eq!(shown(5), ["x"]);
+        assert_eq!(shown(6), ["x", "+10"]);
     }
 
     #[test]
@@ -1262,6 +1289,7 @@ mod tests {
                     signal_dbm: Some(-59),
                     tx_mbps: Some(866.0),
                     generation: Some("Wi-Fi 6"),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -1297,6 +1325,30 @@ mod tests {
         ] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn wifi_link_row_distinguishes_hidden_from_a_failed_scan() {
+        let row = |link: crate::wifi::WifiLink| {
+            let mut m = crate::net::Monitor::default();
+            let mut i = wifi_iface();
+            i.details.as_mut().unwrap().wifi = Some(link);
+            m.ifaces.push(i);
+            render(&mut test_app(m), 100, 40).join("\n")
+        };
+        let hidden = row(crate::wifi::WifiLink {
+            hidden: true,
+            signal_dbm: Some(-70),
+            ..Default::default()
+        });
+        assert!(hidden.contains("hidden SSID"), "{hidden}");
+        assert!(!hidden.contains("scan unavailable"));
+        let failed = row(crate::wifi::WifiLink {
+            signal_dbm: Some(-70),
+            ..Default::default()
+        });
+        assert!(failed.contains("scan unavailable"), "{failed}");
+        assert!(!failed.contains("hidden SSID"));
     }
 
     #[test]

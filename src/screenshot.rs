@@ -136,6 +136,7 @@ fn details(name: &str) -> Details {
                 signal_dbm: Some(-52),
                 tx_mbps: Some(866.7),
                 generation: Some("Wi-Fi 6"),
+                ..Default::default()
             });
         }
         "wg0" => {

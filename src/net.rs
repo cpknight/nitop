@@ -1,6 +1,7 @@
 //! Interface statistics: reads kernel counters and derives rates and totals.
 
 use crate::ifinfo::{self, Details};
+use crate::wifi::Poller as WifiPoller;
 use crate::zerotier::Poller;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -155,6 +156,8 @@ pub struct Monitor {
     addr_refresh_in: f64,
     /// Started when the first ZeroTier interface appears.
     zerotier: Option<Poller>,
+    /// Started when the first Wi-Fi interface appears.
+    wifi: Option<WifiPoller>,
 }
 
 impl Monitor {
@@ -189,8 +192,8 @@ impl Monitor {
                 details.ipv6 = v6;
             }
         }
-        // Just a lock and a copy, and it arrives from another thread whenever it's ready, so
-        // this doesn't wait for the slower refresh above.
+        // Both of these are a lock and a copy. The work happens on other threads.
+        self.apply_wifi();
         for i in &mut self.ifaces {
             if let Some(d) = i
                 .details
@@ -202,6 +205,28 @@ impl Monitor {
             }
         }
         Ok(())
+    }
+
+    fn apply_wifi(&mut self) {
+        let found: Vec<(usize, u32)> = self
+            .ifaces
+            .iter()
+            .enumerate()
+            .filter(|(_, iface)| iface.details.as_ref().is_some_and(|d| d.kind == "Wi-Fi"))
+            .filter_map(|(n, iface)| ifinfo::ifindex(&iface.name).map(|idx| (n, idx)))
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        let poller = self.wifi.get_or_insert_with(WifiPoller::start);
+        poller.watch(found.iter().map(|(_, idx)| *idx));
+        for (n, idx) in found {
+            if let Some(link) = poller.get(idx)
+                && let Some(details) = self.ifaces[n].details.as_mut()
+            {
+                details.wifi = Some(link);
+            }
+        }
     }
 
     pub(crate) fn apply(&mut self, parsed: Vec<(String, Counters)>, dt: f64) {
@@ -358,5 +383,18 @@ mod tests {
         assert_eq!(m.ifaces.len(), 1);
         assert_eq!(m.master.rx.session, 200);
         assert_eq!(m.master.rx.history.len(), 2);
+    }
+
+    #[test]
+    fn missed_read_uses_the_whole_gap_and_does_not_spike_the_peak() {
+        let mut m = Monitor::default();
+        m.apply(vec![("a".into(), c(0, 0))], 0.0);
+        m.apply(vec![("a".into(), c(1000, 0))], 1.0);
+        assert_eq!(m.master.rx.rate, 1000.0);
+        assert_eq!(m.master.rx.peak, 1000.0);
+        // The failed tick records nothing. The next success covers both seconds.
+        m.apply(vec![("a".into(), c(2000, 0))], 2.0);
+        assert_eq!(m.master.rx.rate, 500.0);
+        assert_eq!(m.master.rx.peak, 1000.0);
     }
 }

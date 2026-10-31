@@ -93,12 +93,6 @@ fn demo_app() -> App {
         i.loopback = i.name == "lo";
         i.up = true;
         i.details = Some(details(&i.name));
-        (i.addr, i.speed) = match i.name.as_str() {
-            "eth0" => (Some("192.0.2.10".to_string()), Some(2500)),
-            "wlan0" => (Some("192.0.2.42".to_string()), None),
-            "wg0" => (Some("198.51.100.7".to_string()), None),
-            _ => (Some("127.0.0.1".to_string()), None),
-        };
     }
     m.ifaces
         .sort_by(|a, b| (a.loopback, &a.name).cmp(&(b.loopback, &b.name)));
@@ -124,12 +118,17 @@ fn details(name: &str) -> Details {
             d.driver = Some("r8169".into());
             d.mac = Some("02:00:00:00:00:01".into());
             d.duplex = Some("full".into());
+            d.speed = Some(2500);
+            d.ipv4 = vec!["192.0.2.10/24".into()];
+            d.ipv6 = vec!["2001:db8::10/64".into(), "fe80::1/64".into()];
         }
         "wlan0" => {
             d.kind = "Wi-Fi".into();
             d.hardware = Some("Intel Wi-Fi 6E AX211 160MHz".into());
             d.driver = Some("iwlwifi".into());
             d.mac = Some("02:00:00:00:00:02".into());
+            d.ipv4 = vec!["192.0.2.42/24".into()];
+            d.ipv6 = vec!["fe80::2/64".into()];
             d.wifi = Some(WifiLink {
                 ssid: Some("example-net".into()),
                 freq_mhz: Some(5220),
@@ -142,10 +141,13 @@ fn details(name: &str) -> Details {
         "wg0" => {
             d.kind = "WireGuard VPN".into();
             d.mtu = Some(1420);
+            d.ipv4 = vec!["198.51.100.7/32".into()];
         }
         _ => {
             d.kind = "Loopback".into();
             d.mtu = Some(65536);
+            d.ipv4 = vec!["127.0.0.1/8".into()];
+            d.ipv6 = vec!["::1/128".into()];
         }
     }
     d

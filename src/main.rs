@@ -11,6 +11,7 @@ mod screenshot;
 mod theme;
 mod ui;
 mod wifi;
+mod zerotier;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::io::IsTerminal;
@@ -32,11 +33,11 @@ Options:
   -V, --version  Print the version
 
 Keys:
-  q, Esc, Ctrl-C        Quit
-  b                     Show rates in bytes or bits
-  + / -                 Slower / faster sampling (100 ms to 10 s)
-  Up/Down, j/k          Scroll interface boxes
-  PgUp/PgDn, Home/End   Scroll further
+  q, Esc, Ctrl-C               Quit
+  b                            Show rates in bytes or bits
+  + / -                        Slower / faster sampling (100 ms to 10 s)
+  Arrows, j/k, h/l, PgUp/PgDn  Previous / next page of interfaces
+  Home/End                     First / last page
 ";
 
 pub struct App {
@@ -45,8 +46,8 @@ pub struct App {
     pub theme: theme::Theme,
     pub bits: bool,
     pub interval: usize,
-    /// First visible row of interface boxes.
-    pub scroll: usize,
+    /// Current page of interface boxes.
+    pub page: usize,
 }
 
 impl App {
@@ -57,7 +58,7 @@ impl App {
             theme,
             bits: false,
             interval: DEFAULT_INTERVAL,
-            scroll: 0,
+            page: 0,
         }
     }
 
@@ -65,7 +66,7 @@ impl App {
         INTERVALS_MS[self.interval]
     }
 
-    /// Applies a key press. `scroll` may overshoot here: drawing clamps it to what fits.
+    /// Applies a key press. `page` may overshoot here: drawing clamps it to what fits.
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyResult {
         if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             return KeyResult::Quit;
@@ -77,12 +78,18 @@ impl App {
                 self.interval = (self.interval + 1).min(INTERVALS_MS.len() - 1)
             }
             KeyCode::Char('-') => self.interval = self.interval.saturating_sub(1),
-            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(5),
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = usize::MAX,
+            KeyCode::Up
+            | KeyCode::Left
+            | KeyCode::PageUp
+            | KeyCode::Char('k')
+            | KeyCode::Char('h') => self.page = self.page.saturating_sub(1),
+            KeyCode::Down
+            | KeyCode::Right
+            | KeyCode::PageDown
+            | KeyCode::Char('j')
+            | KeyCode::Char('l') => self.page = self.page.saturating_add(1),
+            KeyCode::Home => self.page = 0,
+            KeyCode::End => self.page = usize::MAX,
             _ => return KeyResult::Ignored,
         }
         KeyResult::Changed
@@ -250,16 +257,26 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_cannot_underflow_or_overflow() {
+    fn paging_cannot_underflow_or_overflow() {
         let mut a = app();
         press(&mut a, KeyCode::Up);
         press(&mut a, KeyCode::PageUp);
-        assert_eq!(a.scroll, 0);
+        assert_eq!(a.page, 0);
+        for key in [
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::PageDown,
+            KeyCode::Char('j'),
+        ] {
+            press(&mut a, key);
+        }
+        assert_eq!(a.page, 4);
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.page, 3);
         press(&mut a, KeyCode::End);
         press(&mut a, KeyCode::Down);
-        press(&mut a, KeyCode::PageDown);
-        assert_eq!(a.scroll, usize::MAX);
+        assert_eq!(a.page, usize::MAX);
         press(&mut a, KeyCode::Home);
-        assert_eq!(a.scroll, 0);
+        assert_eq!(a.page, 0);
     }
 }

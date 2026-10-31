@@ -1,6 +1,7 @@
 //! Interface statistics: reads kernel counters and derives rates and totals.
 
 use crate::ifinfo::{self, Details};
+use crate::zerotier::Poller;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::time::Instant;
@@ -141,9 +142,6 @@ pub struct Iface {
     pub series: Series,
     pub loopback: bool,
     pub up: bool,
-    pub addr: Option<String>,
-    /// Link speed in Mb/s, where the driver reports one.
-    pub speed: Option<u32>,
     /// `None` until first read, so a newly seen interface gets filled in right away.
     pub details: Option<Details>,
 }
@@ -155,6 +153,8 @@ pub struct Monitor {
     pub master: Series,
     /// Seconds until addresses and link details are next reread; starts at 0 so the first sample reads them.
     addr_refresh_in: f64,
+    /// Started when the first ZeroTier interface appears.
+    zerotier: Option<Poller>,
 }
 
 impl Monitor {
@@ -179,12 +179,26 @@ impl Monitor {
         let new_iface = self.ifaces.iter().any(|i| i.details.is_none());
         if self.addr_refresh_in <= 0.0 || new_iface {
             self.addr_refresh_in = ADDR_REFRESH_SECS;
-            let addrs = read_addrs();
+            let mut addrs = read_addrs();
             for i in &mut self.ifaces {
-                i.addr = addrs.get(&i.name).cloned();
                 let name = &i.name;
                 let details = i.details.get_or_insert_with(|| ifinfo::read_static(name));
                 ifinfo::refresh(name, details);
+                let (v4, v6) = addrs.remove(name).unwrap_or_default();
+                details.ipv4 = v4;
+                details.ipv6 = v6;
+            }
+        }
+        // Just a lock and a copy, and it arrives from another thread whenever it's ready, so
+        // this doesn't wait for the slower refresh above.
+        for i in &mut self.ifaces {
+            if let Some(d) = i
+                .details
+                .as_mut()
+                .filter(|d| d.kind.starts_with("ZeroTier"))
+            {
+                let poller = self.zerotier.get_or_insert_with(Poller::start);
+                d.zerotier = poller.lookup(&i.name, d.mac.as_deref());
             }
         }
         Ok(())
@@ -208,8 +222,6 @@ impl Monitor {
                 },
                 loopback,
                 up: true,
-                addr: None,
-                speed: None,
                 details: None,
             });
             let delta = cur.delta(&iface.series.counters);
@@ -241,25 +253,24 @@ fn read_sysfs(i: &mut Iface) {
     // Tunnels and loopback report operstate "unknown" while working normally.
     i.up = flags & IFF_UP != 0 && matches!(oper.trim(), "up" | "unknown");
     i.loopback = i.loopback || flags & IFF_LOOPBACK != 0;
-    // Negative or unreadable when there is no link or the driver has no notion of speed.
-    i.speed = read("speed")
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .filter(|&s| s > 0)
-        .map(|s| s as u32);
 }
 
-/// Primary address per interface: IPv4 if present, otherwise the first IPv6.
-fn read_addrs() -> HashMap<String, String> {
-    let mut out: HashMap<String, (bool, String)> = HashMap::new();
+/// Every address per interface, `ip a` style, as (IPv4, IPv6).
+fn read_addrs() -> HashMap<String, (Vec<String>, Vec<String>)> {
+    use if_addrs::IfAddr;
+    let mut out: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
     for a in if_addrs::get_if_addrs().unwrap_or_default() {
-        let ip = a.ip();
-        let v4 = ip.is_ipv4();
-        let replace = out.get(&a.name).is_none_or(|(had_v4, _)| v4 && !had_v4);
-        if replace {
-            out.insert(a.name, (v4, ip.to_string()));
+        let entry = out.entry(a.name).or_default();
+        match a.addr {
+            IfAddr::V4(v) => entry.0.push(format!("{}/{}", v.ip, v.prefixlen)),
+            IfAddr::V6(v) => entry.1.push(format!("{}/{}", v.ip, v.prefixlen)),
         }
     }
-    out.into_iter().map(|(k, (_, v))| (k, v)).collect()
+    for (_, v6) in out.values_mut() {
+        // Stable: within each group the system's order is kept.
+        v6.sort_by_key(|a| a.starts_with("fe80:"));
+    }
+    out
 }
 
 #[cfg(test)]

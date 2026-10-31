@@ -25,7 +25,7 @@ fn help_documents_every_key() {
         "Quit",
         "bytes or bits",
         "sampling",
-        "Scroll",
+        "page of interfaces",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }

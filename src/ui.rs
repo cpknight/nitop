@@ -6,6 +6,7 @@ use crate::ifinfo::Details;
 use crate::meter::{Meters, Scale};
 use crate::net::{Flow, Series};
 use crate::theme::{Rgb, gradient};
+use crate::zerotier::Info;
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -14,12 +15,15 @@ use ratatui::{
 };
 
 const MIN_BOX_WIDTH: u16 = 60;
-const MIN_BOX_HEIGHT: u16 = 8;
+/// Room for four detail rows and a six-row chart and table.
+const MIN_BOX_HEIGHT: u16 = 12;
+const MAX_COLUMNS: usize = 3;
 const MIN_MASTER_HEIGHT: u16 = 6;
 const TABLE_WIDTH: u16 = 30;
 const MIN_CHART_WIDTH: u16 = 12;
-/// Inner height at which an interface box gives its details a second line.
-const DETAILS_TWO_LINES_FROM: u16 = 7;
+/// Rows the chart and table keep before detail rows take any more of a box.
+const GRAPH_MIN_ROWS: u16 = 6;
+const DETAIL_LABEL_WIDTH: u16 = 6;
 /// Graphs never scale below this, so idle chatter doesn't look like a full-height burst.
 const SCALE_FLOOR_BYTES: f64 = 10.0 * 1024.0;
 
@@ -34,7 +38,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ..area
     };
     let grid = Grid::new(body, app.monitor.ifaces.len());
-    app.scroll = app.scroll.min(grid.max_scroll());
+    app.page = app.page.min(grid.pages() - 1);
 
     let m = &app.monitor;
     let total = m.ifaces.iter().filter(|i| !i.loopback).count();
@@ -53,30 +57,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         },
     );
 
-    for (rect, iface) in grid
-        .visible(app.scroll)
+    let shown = grid.rects(app.page);
+    for (rect, iface) in shown
         .into_iter()
-        .zip(m.ifaces.iter().skip(grid.first_index(app.scroll)))
+        .zip(m.ifaces.iter().skip(grid.first_index(app.page)))
     {
         let state = if iface.up {
             ("up", app.theme.good)
         } else {
             ("down", app.theme.bad)
         };
-        let mut info = vec![(state.0.to_string(), state.1)];
-        if let Some(s) = iface.speed {
-            info.push((fmt_speed(s), app.theme.fg));
-        }
-        if let Some(a) = &iface.addr {
-            info.push((a.clone(), app.theme.fg));
-        }
         draw_box(
             buf,
             rect,
             app,
             &BoxSpec {
                 title: &iface.name,
-                info: &info,
+                info: &[(state.0.to_string(), state.1)],
                 border: app.theme.border,
                 series: &iface.series,
                 details: iface.details.as_ref(),
@@ -97,84 +94,92 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     );
 }
 
-/// Where everything goes for a given terminal size and interface count.
+/// Where everything goes for a given terminal size and interface count: the rollup across
+/// the top, then pages of identically sized interface boxes. Slots with no interface stay
+/// blank.
 struct Grid {
     master: Rect,
     area: Rect,
     n: usize,
     cols: usize,
-    total_rows: usize,
-    visible_rows: usize,
+    /// Rows of boxes on a page. Zero if the terminal is too short for any.
+    rows: usize,
+    box_width: u16,
+    box_height: u16,
 }
 
 impl Grid {
     fn new(body: Rect, n: usize) -> Self {
-        let master_h = (body.height * 2 / 5)
+        let wanted = (body.height * 2 / 5)
             .max(MIN_MASTER_HEIGHT)
             .min(body.height);
-        let master = Rect {
-            height: master_h,
-            ..body
-        };
-        let area = Rect {
-            y: body.y + master_h,
-            height: body.height - master_h,
-            ..body
-        };
-        let cols = ((body.width / MIN_BOX_WIDTH) as usize).clamp(1, n.max(1));
-        let total_rows = n.div_ceil(cols);
+        let space = body.height - wanted;
+        let cols = ((body.width / MIN_BOX_WIDTH) as usize)
+            .clamp(1, MAX_COLUMNS)
+            .min(n.max(1));
         // Too short for a usable box: show none, rather than slivers.
-        let visible_rows = if area.height < 5 {
+        let rows = if space < 5 || n == 0 {
             0
         } else {
-            ((area.height / MIN_BOX_HEIGHT) as usize)
-                .clamp(1, total_rows.max(1))
-                .min(total_rows)
+            ((space / MIN_BOX_HEIGHT) as usize).clamp(1, n.div_ceil(cols))
         };
+        let box_height = if rows == 0 { 0 } else { space / rows as u16 };
+        // What equal rows leave over goes to the rollup, so the bottom row stays on the footer.
+        let used = box_height * rows as u16;
+        let master_height = body.height - used;
         Grid {
-            master,
-            area,
+            master: Rect {
+                height: master_height,
+                ..body
+            },
+            area: Rect {
+                y: body.y + master_height,
+                height: used,
+                ..body
+            },
             n,
             cols,
-            total_rows,
-            visible_rows,
+            rows,
+            box_width: body.width / cols as u16,
+            box_height,
         }
     }
 
-    fn max_scroll(&self) -> usize {
-        self.total_rows.saturating_sub(self.visible_rows)
+    fn per_page(&self) -> usize {
+        self.rows * self.cols
     }
 
-    fn first_index(&self, scroll: usize) -> usize {
-        scroll * self.cols
-    }
-
-    fn visible_count(&self, scroll: usize) -> usize {
-        (self.visible_rows * self.cols).min(self.n - self.first_index(scroll).min(self.n))
-    }
-
-    /// Rects for the visible boxes, in interface order. Rows share the height evenly and
-    /// a short last row stretches to the full width.
-    fn visible(&self, scroll: usize) -> Vec<Rect> {
-        let mut out = Vec::new();
-        let first = self.first_index(scroll);
-        for row in 0..self.visible_rows {
-            let y0 = self.area.height as usize * row / self.visible_rows;
-            let y1 = self.area.height as usize * (row + 1) / self.visible_rows;
-            let start = first + row * self.cols;
-            let in_row = self.cols.min(self.n.saturating_sub(start));
-            for col in 0..in_row {
-                let x0 = self.area.width as usize * col / in_row;
-                let x1 = self.area.width as usize * (col + 1) / in_row;
-                out.push(Rect {
-                    x: self.area.x + x0 as u16,
-                    y: self.area.y + y0 as u16,
-                    width: (x1 - x0) as u16,
-                    height: (y1 - y0) as u16,
-                });
-            }
+    /// Always at least one, so there is always a current page.
+    fn pages(&self) -> usize {
+        match self.per_page() {
+            0 => 1,
+            per_page => self.n.div_ceil(per_page).max(1),
         }
-        out
+    }
+
+    fn first_index(&self, page: usize) -> usize {
+        page * self.per_page()
+    }
+
+    /// Rects for a page's boxes, in interface order. Spare columns are shared out as gaps,
+    /// so the outer boxes line up with the rollup's edges.
+    fn rects(&self, page: usize) -> Vec<Rect> {
+        let count = self
+            .per_page()
+            .min(self.n.saturating_sub(self.first_index(page)));
+        let spare = self.area.width - self.box_width * self.cols as u16;
+        (0..count)
+            .map(|i| {
+                let (row, col) = ((i / self.cols) as u16, (i % self.cols) as u16);
+                let gaps = (self.cols as u16 - 1).max(1);
+                Rect {
+                    x: self.area.x + col * self.box_width + spare * col / gaps,
+                    y: self.area.y + row * self.box_height,
+                    width: self.box_width,
+                    height: self.box_height,
+                }
+            })
+            .collect()
     }
 }
 
@@ -202,15 +207,17 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, grid: &Grid) {
     key(buf, "q", "quit");
     key(buf, "b", if app.bits { "bits" } else { "bytes" });
     key(buf, "+/-", &format!("{}ms", app.interval_ms()));
-    if grid.max_scroll() > 0 {
-        let first = grid.first_index(app.scroll);
+    if grid.pages() > 1 {
+        let first = grid.first_index(app.page);
         let shown = format!(
-            "{}-{}/{}",
+            "page {}/{} ({}-{} of {})",
+            app.page + 1,
+            grid.pages(),
             first + 1,
-            first + grid.visible_count(app.scroll),
+            first + grid.rects(app.page).len(),
             grid.n
         );
-        key(buf, "↑↓", &shown);
+        key(buf, "←→", &shown);
     }
 }
 
@@ -235,14 +242,8 @@ fn draw_box(buf: &mut Buffer, r: Rect, app: &App, spec: &BoxSpec) {
         height: r.height - 2,
     };
     if let Some(d) = spec.details {
-        let max_lines = if inner.height >= DETAILS_TWO_LINES_FROM {
-            2
-        } else if inner.height >= 4 {
-            1
-        } else {
-            0
-        };
-        let used = draw_details(buf, inner, app, d, max_lines);
+        let used = detail_row_count(inner.height);
+        draw_details(buf, inner, app, d, used);
         inner.y += used;
         inner.height -= used;
     }
@@ -351,120 +352,214 @@ fn draw_meter_scale(buf: &mut Buffer, r: Rect, scale: &Scale, style: Style) {
     }
 }
 
-/// One detail about an interface. Order is priority: what doesn't fit is dropped from the end.
-struct Fact {
+/// One value on a detail row.
+struct Seg {
     label: &'static str,
     value: String,
     color: Option<Color>,
+    /// Long values may be cut short to fit. Others are all or nothing.
+    elastic: bool,
 }
 
-fn facts(d: &Details, app: &App) -> Vec<Fact> {
-    let t = &app.theme;
-    let mut out = Vec::new();
-    let mut push = |label, value: String, color| {
-        out.push(Fact {
-            label,
-            value,
-            color,
-        })
-    };
-    push("", d.kind.clone(), Some(t.hi));
-    if d.kind == "Wi-Fi" {
-        match &d.wifi {
-            Some(w) => {
-                match &w.ssid {
-                    Some(ssid) => push("SSID", ssid.clone(), Some(t.title)),
-                    None if w.signal_dbm.is_none() => {
-                        push("", "not connected".into(), Some(t.inactive))
-                    }
-                    None => push("", "hidden SSID".into(), Some(t.inactive)),
-                }
-                if let Some(s) = w.signal_dbm {
-                    let c = if s >= -60 {
-                        t.good
-                    } else if s <= -75 {
-                        t.bad
-                    } else {
-                        t.fg
-                    };
-                    push("", format!("{s} dBm"), Some(c));
-                }
-                if let Some(b) = w.band() {
-                    push("", b, None);
-                }
-                if let Some(g) = w.generation {
-                    push("", g.into(), None);
-                }
-                if let Some(r) = w.tx_mbps {
-                    push("", format!("{r:.0} Mbps"), None);
-                }
-            }
-            None => push("", "link info unavailable".into(), Some(t.inactive)),
+impl Seg {
+    fn new(value: impl Into<String>) -> Self {
+        Seg {
+            label: "",
+            value: value.into(),
+            color: None,
+            elastic: false,
         }
     }
-    if let Some(h) = &d.hardware {
-        push("", h.clone(), None);
-    }
-    if let Some(v) = &d.driver {
-        push("driver", v.clone(), None);
-    }
-    if let Some(v) = &d.duplex {
-        push("", format!("{v} duplex"), None);
-    }
-    if let Some(v) = &d.mac {
-        push("MAC", v.clone(), None);
-    }
-    if let Some(v) = d.mtu {
-        push("MTU", v.to_string(), None);
-    }
-    out
-}
 
-/// Flows facts into up to `max_lines` rows; returns how many rows it used. A fact too long
-/// for a whole row (a long hardware name) is truncated rather than lost.
-fn draw_details(buf: &mut Buffer, r: Rect, app: &App, d: &Details, max_lines: u16) -> u16 {
-    const GAP: usize = 2;
-    let t = &app.theme;
-    let width = r.width as usize;
-    let mut line = 0u16;
-    let mut used = 0usize;
-    for fact in facts(d, app) {
-        if max_lines == 0 {
-            break;
-        }
-        let label_len = if fact.label.is_empty() {
+    fn label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
+    }
+
+    fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    fn elastic(mut self) -> Self {
+        self.elastic = true;
+        self
+    }
+
+    fn label_width(&self) -> usize {
+        if self.label.is_empty() {
             0
         } else {
-            fact.label.len() + 1
-        };
-        let value = truncate(&fact.value, width.saturating_sub(label_len));
-        let len = label_len + value.chars().count();
-        let start = if used == 0 { 0 } else { used + GAP };
-        let (line_now, x) = if start + len <= width {
-            (line, start)
-        } else if line + 1 < max_lines {
-            (line + 1, 0)
-        } else {
-            continue; // a shorter, later fact may still fit
-        };
-        line = line_now;
-        let y = r.y + line;
-        let mut cx = r.x + x as u16;
-        if label_len > 0 {
-            cx = put(buf, cx, y, r, fact.label, Style::new().fg(t.inactive));
-            cx += 1;
+            self.label.len() + 1
         }
-        put(
-            buf,
-            cx,
-            y,
-            r,
-            &value,
-            Style::new().fg(fact.color.unwrap_or(t.fg)),
-        );
-        used = x + len;
     }
-    if max_lines == 0 { 0 } else { line + 1 }
+}
+
+/// The detail rows, as `ip a` lays them out, in the order they're displayed. The number is
+/// each row's rank for inclusion when a box has too little height for all of them.
+const DETAIL_ROWS: [(&str, usize); 5] = [
+    ("type", 0),
+    ("link", 2),
+    ("inet", 1),
+    ("inet6", 3),
+    ("ether", 4),
+];
+
+/// How many detail rows a box shows. Every box is the same size, so they all show the same
+/// rows on the same lines.
+fn detail_row_count(inner_height: u16) -> u16 {
+    let spare = inner_height.saturating_sub(GRAPH_MIN_ROWS);
+    if spare > 0 {
+        spare.min(DETAIL_ROWS.len() as u16)
+    } else {
+        u16::from(inner_height >= 4)
+    }
+}
+
+fn type_segments(d: &Details, app: &App) -> Vec<Seg> {
+    let mut row = vec![Seg::new(d.kind.clone()).color(app.theme.hi)];
+    if let Some(h) = &d.hardware {
+        row.push(Seg::new(h.clone()).elastic());
+    }
+    if let Some(v) = &d.driver {
+        row.push(Seg::new(v.clone()).label("driver"));
+    }
+    row
+}
+
+fn link_segments(d: &Details, app: &App) -> Vec<Seg> {
+    let t = &app.theme;
+    let mut row = Vec::new();
+    if d.kind == "Wi-Fi" {
+        let Some(w) = &d.wifi else {
+            return vec![Seg::new("link info unavailable").color(t.inactive)];
+        };
+        row.push(match &w.ssid {
+            Some(ssid) => Seg::new(ssid.clone())
+                .label("SSID")
+                .color(t.title)
+                .elastic(),
+            None if w.signal_dbm.is_none() => Seg::new("not connected").color(t.inactive),
+            None => Seg::new("hidden SSID").color(t.inactive),
+        });
+        if let Some(s) = w.signal_dbm {
+            let c = if s >= -60 {
+                t.good
+            } else if s <= -75 {
+                t.bad
+            } else {
+                t.fg
+            };
+            row.push(Seg::new(format!("{s} dBm")).color(c));
+        }
+        row.extend(w.band().map(Seg::new));
+        row.extend(w.generation.map(Seg::new));
+        row.extend(w.tx_mbps.map(|r| Seg::new(format!("{r:.0} Mbps"))));
+    } else if d.kind.starts_with("ZeroTier") {
+        match &d.zerotier {
+            Some(Info::Network(n)) => {
+                if let Some(name) = &n.name {
+                    row.push(Seg::new(name.clone()).color(t.title).elastic());
+                }
+                row.push(Seg::new(n.id.clone()));
+                if let Some(status) = &n.status {
+                    let c = if status == "OK" { t.good } else { t.bad };
+                    row.push(Seg::new(status.clone()).color(c));
+                }
+                row.extend(n.kind.clone().map(Seg::new));
+            }
+            Some(Info::Unavailable(why)) => row.push(Seg::new(*why).color(t.inactive)),
+            None => {}
+        }
+    } else if d.kind == "Ethernet" {
+        row.extend(d.speed.map(|s| Seg::new(fmt_speed(s))));
+        row.extend(d.duplex.as_ref().map(|v| Seg::new(format!("{v} duplex"))));
+    }
+    row
+}
+
+/// As many addresses as fit in `width`, then a count of the rest.
+fn address_segments(addresses: &[String], width: usize) -> Vec<Seg> {
+    const GAP: usize = 2;
+    const MORE: usize = 2 + GAP; // "+9" and the gap before it
+    let mut row = Vec::new();
+    let mut used = 0;
+    for (i, a) in addresses.iter().enumerate() {
+        let len = a.chars().count() + if i == 0 { 0 } else { GAP };
+        let last = i + 1 == addresses.len();
+        let reserve = if last { 0 } else { MORE };
+        if used + len + reserve > width {
+            if i == 0 {
+                row.push(Seg::new(a.clone()).elastic());
+                break;
+            }
+            row.push(Seg::new(format!("+{}", addresses.len() - i)));
+            break;
+        }
+        row.push(Seg::new(a.clone()));
+        used += len;
+    }
+    row
+}
+
+fn ether_segments(d: &Details) -> Vec<Seg> {
+    let mut row: Vec<Seg> = d.mac.iter().map(|m| Seg::new(m.clone())).collect();
+    row.extend(d.mtu.map(|v| Seg::new(v.to_string()).label("mtu")));
+    row
+}
+
+fn draw_details(buf: &mut Buffer, r: Rect, app: &App, d: &Details, rows: u16) {
+    let t = &app.theme;
+    let value_width = (r.width.saturating_sub(DETAIL_LABEL_WIDTH)) as usize;
+    let mut y = r.y;
+    for (label, rank) in DETAIL_ROWS {
+        if rank >= rows as usize {
+            continue;
+        }
+        let segments = match label {
+            "type" => type_segments(d, app),
+            "link" => link_segments(d, app),
+            "inet" => address_segments(&d.ipv4, value_width),
+            "inet6" => address_segments(&d.ipv6, value_width),
+            _ => ether_segments(d),
+        };
+        let line = Rect { y, height: 1, ..r };
+        put(buf, r.x, y, line, label, Style::new().fg(t.inactive));
+        draw_segments(buf, line, app, &segments);
+        y += 1;
+    }
+}
+
+/// Lays values out along one row and never wraps: what doesn't fit is cut or left off.
+fn draw_segments(buf: &mut Buffer, line: Rect, app: &App, segments: &[Seg]) {
+    const GAP: u16 = 2;
+    const MIN_ELASTIC: usize = 6;
+    let t = &app.theme;
+    let mut x = line.x + DETAIL_LABEL_WIDTH;
+    if x >= line.right() {
+        return;
+    }
+    if segments.is_empty() {
+        put(buf, x, line.y, line, "—", Style::new().fg(t.inactive));
+        return;
+    }
+    for seg in segments {
+        let room = line.right().saturating_sub(x) as usize;
+        let label = seg.label_width();
+        let len = label + seg.value.chars().count();
+        let value = if len <= room {
+            seg.value.clone()
+        } else if seg.elastic && room >= label + MIN_ELASTIC {
+            truncate(&seg.value, room - label)
+        } else {
+            return;
+        };
+        if label > 0 {
+            x = put(buf, x, line.y, line, seg.label, Style::new().fg(t.inactive)) + 1;
+        }
+        let style = Style::new().fg(seg.color.unwrap_or(t.fg));
+        x = put(buf, x, line.y, line, &value, style) + GAP;
+    }
 }
 
 /// Rounded border with btop's `┐title┌` tabs: title on the left, facts on the right.
@@ -896,10 +991,10 @@ mod tests {
     }
 
     #[test]
-    fn grid_never_leaves_the_body_at_any_size() {
-        for w in [10u16, 40, 59, 60, 80, 120, 200, 400] {
+    fn grid_never_leaves_the_body_and_all_boxes_are_equal() {
+        for w in [10u16, 40, 59, 60, 80, 120, 131, 179, 180, 200, 400] {
             for h in [1u16, 5, 8, 14, 24, 50, 100] {
-                for n in [0usize, 1, 2, 3, 7, 40] {
+                for n in [0usize, 1, 2, 3, 4, 5, 7, 40] {
                     let body = Rect {
                         x: 0,
                         y: 0,
@@ -908,17 +1003,238 @@ mod tests {
                     };
                     let g = Grid::new(body, n);
                     assert!(g.master.bottom() <= h);
-                    for scroll in 0..=g.max_scroll() {
-                        let rects = g.visible(scroll);
-                        assert_eq!(rects.len(), g.visible_count(scroll), "{w}x{h} n={n}");
-                        for r in rects {
+                    assert!(g.cols <= MAX_COLUMNS);
+                    let mut seen = 0;
+                    for page in 0..g.pages() {
+                        for r in g.rects(page) {
                             assert!(r.right() <= w && r.bottom() <= h, "{w}x{h} n={n} {r:?}");
+                            assert!(r.y >= g.master.bottom(), "{w}x{h} n={n} {r:?}");
+                            assert_eq!((r.width, r.height), (g.box_width, g.box_height));
                             assert!(r.width > 0 && r.height > 0);
+                            seen += 1;
                         }
+                    }
+                    if g.rows > 0 {
+                        assert_eq!(seen, n, "{w}x{h}: every interface is on some page");
                     }
                 }
             }
         }
+    }
+
+    fn grid(w: u16, h: u16, n: usize) -> Grid {
+        Grid::new(
+            Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            n,
+        )
+    }
+
+    #[test]
+    fn columns_are_at_most_three_and_at_least_one() {
+        assert_eq!(grid(400, 60, 7).cols, 3);
+        assert_eq!(grid(180, 60, 7).cols, 3);
+        assert_eq!(grid(179, 60, 7).cols, 2);
+        assert_eq!(grid(120, 60, 7).cols, 2);
+        assert_eq!(grid(40, 60, 7).cols, 1);
+        assert_eq!(grid(400, 60, 2).cols, 2);
+    }
+
+    #[test]
+    fn leftover_slots_stay_blank_and_boxes_keep_their_size() {
+        let g = grid(200, 60, 4);
+        let rects = g.rects(0);
+        assert_eq!(rects.len(), 4);
+        assert_eq!(rects[3].width, rects[0].width);
+        assert_eq!(rects[3].x, 0, "fourth box starts a new row at the left");
+        assert_eq!(rects[3].y, rects[0].y + rects[0].height);
+    }
+
+    #[test]
+    fn outer_boxes_line_up_with_the_rollup() {
+        for w in [180u16, 181, 182, 200, 241] {
+            let g = grid(w, 60, 3);
+            let rects = g.rects(0);
+            assert_eq!(rects[0].x, 0);
+            assert_eq!(rects[2].right(), w, "width {w}");
+        }
+    }
+
+    #[test]
+    fn bottom_row_sits_on_the_footer() {
+        for h in 20..60u16 {
+            let g = grid(120, h, 5);
+            assert_eq!(g.area.bottom(), h);
+            assert_eq!(g.master.bottom(), g.area.y);
+        }
+    }
+
+    #[test]
+    fn pages_divide_interfaces_and_the_last_may_be_short() {
+        let g = grid(120, 30, 5); // two columns, one row
+        assert_eq!((g.cols, g.rows), (2, 1));
+        assert_eq!(g.pages(), 3);
+        assert_eq!(g.rects(0).len(), 2);
+        assert_eq!(g.rects(2).len(), 1);
+        assert_eq!(g.rects(2)[0].width, g.rects(0)[0].width);
+        assert_eq!(g.first_index(2), 4);
+    }
+
+    #[test]
+    fn page_is_clamped_and_shown_in_the_footer() {
+        let mut m = crate::net::Monitor::default();
+        for name in ["a", "b", "c"] {
+            let mut i = wifi_iface();
+            i.name = name.into();
+            m.ifaces.push(i);
+        }
+        let mut app = test_app(m);
+        app.page = usize::MAX;
+        let text = render(&mut app, 120, 30).join("\n");
+        assert_eq!(app.page, 1);
+        assert!(text.contains("page 2/2 (3-3 of 3)"), "{text}");
+        assert!(!text.contains("┐a┌") && text.contains("┐c┌"), "{text}");
+    }
+
+    #[test]
+    fn detail_rows_line_up_across_boxes_whatever_they_contain() {
+        // Very different contents, at many sizes.
+        let mut m = crate::net::Monitor::default();
+        m.ifaces.push(wifi_iface());
+        let mut other = wifi_iface();
+        other.name = "lo".into();
+        other.details = Some(Details {
+            kind: "Loopback".into(),
+            mtu: Some(65536),
+            ipv4: vec!["127.0.0.1/8".into()],
+            ..Default::default()
+        });
+        m.ifaces.push(other);
+        let mut app = test_app(m);
+        for w in (120..=178).step_by(7) {
+            for h in [24u16, 30, 37, 44, 50] {
+                let lines = render(&mut app, w, h);
+                let top = lines.iter().position(|l| l.contains("┐wlan0┌")).unwrap();
+                let half = w as usize / 2;
+                let col = |l: &str, from: usize, to: usize| -> String {
+                    l.chars().skip(from).take(to - from).take(7).collect()
+                };
+                for line in &lines[top + 1..] {
+                    let left = col(line, 1, half);
+                    let start = line
+                        .chars()
+                        .enumerate()
+                        .skip(half)
+                        .find(|(_, c)| *c == '│' || *c == '╰');
+                    let Some((start, _)) = start else { continue };
+                    let right = col(line, start + 1, start + 8);
+                    for label in ["type", "link", "inet6", "inet ", "ether"] {
+                        assert_eq!(
+                            left.starts_with(label),
+                            right.starts_with(label),
+                            "{w}x{h}: {label:?} misaligned:\n{}",
+                            lines.join("\n")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_details_show_a_dash_rather_than_closing_up() {
+        let mut m = crate::net::Monitor::default();
+        let mut i = wifi_iface();
+        i.details = Some(Details {
+            kind: "Bridge".into(),
+            ..Default::default()
+        });
+        m.ifaces.push(i);
+        let text = render(&mut test_app(m), 100, 40).join("\n");
+        for label in ["link", "inet ", "inet6", "ether"] {
+            assert!(text.contains(&format!("{label:<6}—")), "{label}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn long_values_never_wrap_or_leave_their_row() {
+        let mut m = crate::net::Monitor::default();
+        let mut i = wifi_iface();
+        let d = i.details.as_mut().unwrap();
+        d.hardware = Some("An Extremely Long Hardware Name ".repeat(5));
+        d.ipv6 = (0..6).map(|n| format!("2001:db8::{n}/64")).collect();
+        m.ifaces.push(i);
+        let lines = render(&mut test_app(m), 62, 40);
+        let text = lines.join("\n");
+        assert!(text.contains("…"), "hardware is cut:\n{text}");
+        assert!(text.contains("+"), "extra addresses are counted:\n{text}");
+        assert_eq!(text.matches("type  ").count(), 1);
+        assert_eq!(text.matches("inet6 ").count(), 1);
+        assert!(lines.iter().all(|l| l.chars().count() == 62));
+    }
+
+    #[test]
+    fn address_list_counts_what_does_not_fit() {
+        let a: Vec<String> = ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let values = |width| -> Vec<String> {
+            address_segments(&a, width)
+                .into_iter()
+                .map(|s| s.value)
+                .collect()
+        };
+        assert_eq!(values(34), ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"]);
+        assert_eq!(values(30), ["aaaaaaaaaa", "bbbbbbbbbb", "+1"]);
+        assert_eq!(values(20), ["aaaaaaaaaa", "+2"]);
+        assert_eq!(values(5), ["aaaaaaaaaa"]);
+        assert!(address_segments(&[], 30).is_empty());
+    }
+
+    #[test]
+    fn detail_rows_grow_with_the_box_and_keep_the_graph_usable() {
+        assert_eq!(detail_row_count(3), 0);
+        assert_eq!(detail_row_count(4), 1);
+        assert_eq!(detail_row_count(6), 1);
+        assert_eq!(detail_row_count(8), 2);
+        assert_eq!(detail_row_count(10), 4);
+        assert_eq!(detail_row_count(40), 5);
+    }
+
+    #[test]
+    fn zerotier_box_shows_network_or_says_why_not() {
+        let box_with = |zt: Option<Info>| {
+            let mut m = crate::net::Monitor::default();
+            let mut i = wifi_iface();
+            i.details = Some(Details {
+                kind: "ZeroTier VPN (TAP)".into(),
+                zerotier: zt,
+                ..Default::default()
+            });
+            m.ifaces.push(i);
+            render(&mut test_app(m), 100, 40).join("\n")
+        };
+        let net = crate::zerotier::Network {
+            id: "8056c2e21c000001".into(),
+            name: Some("office".into()),
+            status: Some("OK".into()),
+            kind: Some("PRIVATE".into()),
+            ..Default::default()
+        };
+        let text = box_with(Some(Info::Network(net)));
+        assert!(
+            text.contains("link  office  8056c2e21c000001  OK  PRIVATE"),
+            "{text}"
+        );
+        let text = box_with(Some(Info::Unavailable("no access to zerotier-cli")));
+        assert!(text.contains("link  no access to zerotier-cli"), "{text}");
+        let text = box_with(None);
+        assert!(text.contains("link  —"), "{text}");
     }
 
     fn test_app(monitor: crate::net::Monitor) -> crate::App {
@@ -931,15 +1247,14 @@ mod tests {
             series: Series::default(),
             loopback: false,
             up: true,
-            addr: None,
-            speed: None,
             details: Some(Details {
                 kind: "Wi-Fi".into(),
                 hardware: Some("Intel Wi-Fi 6E AX211 160MHz".into()),
                 driver: Some("iwlwifi".into()),
                 mac: Some("02:00:00:00:00:01".into()),
                 mtu: Some(1500),
-                duplex: None,
+                ipv4: vec!["192.0.2.1/24".into()],
+                ipv6: vec!["2001:db8::1/64".into(), "fe80::1/64".into()],
                 wifi: Some(crate::wifi::WifiLink {
                     ssid: Some("homenet".into()),
                     freq_mhz: Some(5220),
@@ -948,6 +1263,7 @@ mod tests {
                     tx_mbps: Some(866.0),
                     generation: Some("Wi-Fi 6"),
                 }),
+                ..Default::default()
             }),
         }
     }
@@ -975,7 +1291,9 @@ mod tests {
             "866 Mbps",
             "Intel Wi-Fi 6E AX211",
             "driver iwlwifi",
-            "MAC 02:00",
+            "ether 02:00:00:00:00:01  mtu 1500",
+            "inet  192.0.2.1/24",
+            "inet6 2001:db8::1/64  fe80::1/64",
         ] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
@@ -1024,7 +1342,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let (monitor, _) = crate::net::Monitor::new().unwrap();
         let mut app = crate::App::new(monitor, crate::theme::Theme::load());
-        app.scroll = usize::MAX;
+        app.page = usize::MAX;
         for w in [1u16, 9, 10, 12, 13, 30, 42, 44, 60, 80, 200] {
             for h in [1u16, 2, 3, 4, 5, 8, 12, 24, 60] {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();

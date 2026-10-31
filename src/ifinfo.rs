@@ -2,6 +2,7 @@
 //! ID databases.
 
 use crate::wifi::{self, WifiLink};
+use crate::zerotier;
 use std::fs;
 use std::path::Path;
 
@@ -29,6 +30,13 @@ pub struct Details {
     pub mac: Option<String>,
     pub mtu: Option<u32>,
     pub duplex: Option<String>,
+    /// Link speed in Mb/s, on Ethernet.
+    pub speed: Option<u32>,
+    /// With prefix length, e.g. `192.0.2.1/24`.
+    pub ipv4: Vec<String>,
+    /// With prefix length, global addresses before link-local ones.
+    pub ipv6: Vec<String>,
+    pub zerotier: Option<zerotier::Info>,
     /// Present on Wi-Fi interfaces.
     pub wifi: Option<WifiLink>,
 }
@@ -155,6 +163,13 @@ fn refresh_in(roots: &Roots, name: &str, d: &mut Details) {
         .then(|| read("duplex"))
         .flatten()
         .filter(|s| s == "full" || s == "half");
+    // Negative or unreadable with no link. Virtual devices report made-up speeds.
+    d.speed = (d.kind == "Ethernet")
+        .then(|| read("speed"))
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&s| s > 0)
+        .map(|s| s as u32);
     if d.kind == "Wi-Fi" {
         d.wifi = read("ifindex")
             .and_then(|s| s.parse().ok())
@@ -387,6 +402,7 @@ mod tests {
                 ("address", "02:00:00:00:00:01\n"),
                 ("mtu", "1500\n"),
                 ("duplex", "full\n"),
+                ("speed", "2500\n"),
             ],
         );
         s.device("eth0", "pci/0000:01:00.0", "pci", "r8169");
@@ -402,6 +418,7 @@ mod tests {
         assert_eq!(d.mac.as_deref(), Some("02:00:00:00:00:01"));
         assert_eq!(d.mtu, Some(1500));
         assert_eq!(d.duplex.as_deref(), Some("full"));
+        assert_eq!(d.speed, Some(2500));
     }
 
     #[test]
@@ -475,6 +492,7 @@ mod tests {
         assert_eq!(zt.kind, "ZeroTier VPN (TAP)");
         assert_eq!(zt.hardware, None);
         assert_eq!(zt.duplex, None);
+        assert_eq!(zt.speed, None);
         assert_eq!(s.read("br0").kind, "Bridge");
     }
 

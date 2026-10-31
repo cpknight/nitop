@@ -23,6 +23,7 @@ CI runs the format check, clippy and tests on every pull request, so running the
 | `src/net.rs` | Reads kernel counters and derives rates and totals |
 | `src/ifinfo.rs` | Works out what an interface is, from sysfs and `hwdata` |
 | `src/wifi.rs` | Wi-Fi link state, over nl80211 |
+| `src/zerotier.rs` | ZeroTier network details, on a background thread |
 | `src/meter.rs` | Level meter behavior and scale |
 | `src/theme.rs` | Loads colors from the btop theme |
 | `src/ui.rs` | All drawing |
@@ -53,6 +54,7 @@ AI-assisted contributions are welcome, as nitop itself was written that way. Ple
 ## Releasing (maintainers)
 
 1. Update `version` in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, and move "Unreleased" in `CHANGELOG.md` to a dated version.
-2. Commit, then tag and push: `git tag v0.2.0 && git push origin main v0.2.0`.
-
-The release workflow checks the tag against `Cargo.toml`, builds the binaries and publishes the GitHub release.
+2. Commit, then tag and push, using the new version: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+3. Wait for the release workflow. It checks the tag against `Cargo.toml`, builds the binaries and publishes the GitHub release.
+4. If nitop is on crates.io, run `cargo publish` from a clean checkout of the tag. A published version can't be changed or reused.
+5. If nitop is on the AUR, update `nitop` and `nitop-bin`: set `pkgver`, reset `pkgrel` to 1, run `updpkgsums`, regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`, and push. `nitop-bin` needs the files from step 3.

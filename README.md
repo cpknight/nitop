@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/cpknight/nitop/actions/workflows/ci.yml/badge.svg)](https://github.com/cpknight/nitop/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/cpknight/nitop)](https://github.com/cpknight/nitop/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/nitop)](https://crates.io/crates/nitop)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A [btop](https://github.com/aristocratos/btop)-style terminal monitor for network interfaces. It shows every interface at a glance, each in its own box, with one rollup of all your traffic on top.
@@ -34,11 +35,13 @@ install -Dm755 nitop ~/.local/bin/nitop
 
 For ARM64, use `nitop-aarch64-unknown-linux-musl.tar.gz`. Checksums are on the [releases page](https://github.com/cpknight/nitop/releases).
 
-**From source** (requires Rust 1.89 or newer):
+**From [crates.io](https://crates.io/crates/nitop)** (requires Rust 1.89 or newer):
 
 ```sh
-cargo install --locked --git https://github.com/cpknight/nitop
+cargo install --locked nitop
 ```
+
+To build the latest unreleased code instead, run `cargo install --locked --git https://github.com/cpknight/nitop`.
 
 ## Usage
 

@@ -4,6 +4,10 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Added
+
+- nitop is now on [crates.io](https://crates.io/crates/nitop), so it can be installed with `cargo install --locked nitop`.
+
 ## [0.2.1] - 2026-10-31
 
 ### Fixed
